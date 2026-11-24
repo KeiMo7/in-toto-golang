@@ -12,6 +12,7 @@ var (
 	pubKeyPaths       []string
 	linkDir           string
 	intermediatePaths []string
+	verdictReportPath string
 )
 
 var verifyCmd = &cobra.Command{
@@ -78,6 +79,16 @@ addition to any intermediates in the layout.`,
 operating systems. It is done by replacing all line separators
 with a new line character.`,
 	)
+
+	verifyCmd.Flags().StringVar(
+		&verdictReportPath,
+		"verdict-report",
+		"",
+		`Optional path to write a structured JSON verdict report. The
+report records every check executed and every candidate evidence
+discovered, classified as accepted, rejected or ignored. It does
+not change the verification result, output or exit code.`,
+	)
 }
 
 func verify(cmd *cobra.Command, args []string) error {
@@ -108,7 +119,28 @@ func verify(cmd *cobra.Command, args []string) error {
 		intermediatePems = append(intermediatePems, pemBytes)
 	}
 
-	_, err = intoto.InTotoVerify(layoutMb, layoutKeys, linkDir, "", make(map[string]string), intermediatePems, lineNormalization)
+	// Without the optional verdict report flag the code path and error
+	// semantics are identical to the previous behavior.
+	if verdictReportPath == "" {
+		_, err = intoto.InTotoVerify(layoutMb, layoutKeys, linkDir, "",
+			make(map[string]string), intermediatePems, lineNormalization)
+		if err != nil {
+			return fmt.Errorf("inspection failed: %w", err)
+		}
+		return nil
+	}
+
+	// With the flag, the same verification is performed together with a
+	// structured verdict report. The report is written on both pass and
+	// reject so that failures remain explainable after the fact.
+	_, report, err := intoto.InTotoVerifyWithAudit(layoutMb, layoutKeys, linkDir,
+		"", make(map[string]string), intermediatePems, lineNormalization)
+	if report != nil {
+		if reportErr := report.WriteJSON(verdictReportPath); reportErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to write verdict report to %s: %s\n",
+				verdictReportPath, reportErr)
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("inspection failed: %w", err)
 	}
