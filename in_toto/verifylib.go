@@ -6,6 +6,7 @@ See https://github.com/in-toto/docs/blob/master/in-toto-spec.md
 package in_toto
 
 import (
+	"context"
 	"crypto/x509"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -398,15 +400,16 @@ func ReduceStepsMetadata(layout Layout,
 				"', no link metadata found.")
 		}
 
-		// Get the first link (could be any link) for the current step, which will
-		// serve as reference link for below comparisons
-		var referenceKeyID string
-		var referenceLinkEnv Metadata
-		for keyID, linkEnv := range linksPerStep {
-			referenceLinkEnv = linkEnv
-			referenceKeyID = keyID
-			break
+		// Get a deterministic reference link (the one with the smallest key
+		// id) for the current step, which will serve as reference link for
+		// below comparisons.
+		keyIDs := make([]string, 0, len(linksPerStep))
+		for keyID := range linksPerStep {
+			keyIDs = append(keyIDs, keyID)
 		}
+		sort.Strings(keyIDs)
+		referenceKeyID := keyIDs[0]
+		referenceLinkEnv := linksPerStep[referenceKeyID]
 
 		// Only one link, nothing to reduce, take the reference link
 		if len(linksPerStep) == 1 {
@@ -556,12 +559,32 @@ func VerifyLinkSignatureThesholds(layout Layout,
 			stepErr = fmt.Errorf("no links found")
 		}
 
+		// Iterate signer key ids in sorted order for deterministic results.
+		signerKeyIDs := make([]string, 0, len(linksPerStep))
+		for signerKeyID := range linksPerStep {
+			signerKeyIDs = append(signerKeyIDs, signerKeyID)
+		}
+		sort.Strings(signerKeyIDs)
+
 		// For each link corresponding to a step, check that the signer key was
 		// authorized, the layout contains a verification key and the signature
 		// verification passes.  Only good links are stored, to verify thresholds
-		// below.
-		isAuthorizedSignature := false
-		for signerKeyID, linkEnv := range linksPerStep {
+		// below. Each candidate is judged independently: authorization state of
+		// one candidate must never leak into the next one.
+		for _, signerKeyID := range signerKeyIDs {
+			linkEnv := linksPerStep[signerKeyID]
+
+			// Reject links whose payload name does not match the step. Layout
+			// payloads (sublayouts) are exempt from this check.
+			if link, isLink := linkEnv.GetPayload().(Link); isLink {
+				if link.Name != step.Name {
+					stepErr = fmt.Errorf("link name '%s' does not match step '%s'",
+						link.Name, step.Name)
+					continue
+				}
+			}
+
+			isAuthorizedSignature := false
 			for _, authorizedKeyID := range step.PubKeys {
 				if signerKeyID == authorizedKeyID {
 					if verifierKey, ok := layout.Keys[authorizedKeyID]; ok {
@@ -569,6 +592,8 @@ func VerifyLinkSignatureThesholds(layout Layout,
 							linksPerStepVerified[signerKeyID] = linkEnv
 							isAuthorizedSignature = true
 							break
+						} else {
+							stepErr = err
 						}
 					}
 				}
@@ -944,18 +969,18 @@ func InTotoVerify(layoutEnv Metadata, layoutKeys map[string]Key,
 		return nil, err
 	}
 
-	// Load links for layout
-	stepsMetadata, err := LoadLinksForLayout(layout, linkDir)
+	// Aggregate link files for the layout and verify their signatures in a
+	// bounded, concurrent and deterministic pass.
+	aggregator := LinkAggregator{
+		LinkDir:              linkDir,
+		RootCertPool:         rootCertPool,
+		IntermediateCertPool: intermediateCertPool,
+	}
+	linkReport, err := aggregator.Aggregate(context.Background(), layout)
 	if err != nil {
 		return nil, err
 	}
-
-	// Verify link signatures
-	stepsMetadataVerified, err := VerifyLinkSignatureThesholds(layout,
-		stepsMetadata, rootCertPool, intermediateCertPool)
-	if err != nil {
-		return nil, err
-	}
+	stepsMetadataVerified := linkReport.VerifiedLinks()
 
 	// Verify and resolve sublayouts
 	stepsSublayoutVerified, err := VerifySublayouts(layout,
@@ -1084,18 +1109,18 @@ func InTotoVerifyWithDirectory(layoutEnv Metadata, layoutKeys map[string]Key,
 		return nil, err
 	}
 
-	// Load links for layout
-	stepsMetadata, err := LoadLinksForLayout(layout, linkDir)
+	// Aggregate link files for the layout and verify their signatures in a
+	// bounded, concurrent and deterministic pass.
+	aggregator := LinkAggregator{
+		LinkDir:              linkDir,
+		RootCertPool:         rootCertPool,
+		IntermediateCertPool: intermediateCertPool,
+	}
+	linkReport, err := aggregator.Aggregate(context.Background(), layout)
 	if err != nil {
 		return nil, err
 	}
-
-	// Verify link signatures
-	stepsMetadataVerified, err := VerifyLinkSignatureThesholds(layout,
-		stepsMetadata, rootCertPool, intermediateCertPool)
-	if err != nil {
-		return nil, err
-	}
+	stepsMetadataVerified := linkReport.VerifiedLinks()
 
 	// Verify and resolve sublayouts
 	stepsSublayoutVerified, err := VerifySublayouts(layout,
